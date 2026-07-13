@@ -50,6 +50,8 @@ fi
 
 # ═══ Source agent fix loop library ═══
 source "${PHASES_DIR}/agent_fix_loop.sh"
+# Agent-synthesized run narrative (resolution summary + recipe/report narrative)
+source "${PHASES_DIR}/synthesize.sh"
 
 # ═══ Parse arguments ═══
 TASK_JSON=""
@@ -134,11 +136,9 @@ scheme_map = {
 }
 scheme = scheme_map.get(scheme, scheme)
 
-# Normalize method from iters — but NEVER override an explicit MODEL_FREE request
-# (model-free runs carry iters=0, which would otherwise be mis-normalized to RTN
-# and lose the "ModelFree" suffix in the result/artifact naming).
+# Normalize method from iters
 iters = task.get("iters", None)
-if iters is not None and str(method).strip().upper() not in ("MODEL_FREE", "MODELFREE"):
+if iters is not None:
     method = "RTN" if int(iters) == 0 else "TUNING"
 
 print(f'MODEL_ID="{model}"')
@@ -298,6 +298,10 @@ log_step "Pipeline: ${MODEL_ID} | ${SCHEME}/${METHOD}/${EXPORT_FORMAT}"
 PIPELINE_START=$(date +%s)
 FAILED_STEPS=()
 
+# Provision the selected agent fix-loop backend (openclaw | copilot).
+log_info "Agent fix-loop backend: ${AGENT_BACKEND:-openclaw}"
+agent_backend_setup
+
 # --- Phase 1: Environment Setup ---
 if [[ "$SKIP_AGENT" == "true" ]]; then
     bash "${PHASES_DIR}/setup_env.sh" 2>&1 | tee "${LOG_DIR}/setup_env.log"
@@ -352,9 +356,10 @@ else
     log_error "Pipeline failed at: ${FAILED_STEPS[*]} (${PIPELINE_DURATION}s)"
 fi
 
-# ═══ Collect OpenClaw session logs ═══
-# Copy .jsonl session files from the openclaw sessions directory into RUN_OUTPUT_DIR,
-# then format them to human-readable .md (matching old pipeline behavior)
+# ═══ Collect agent session logs (backend-aware) ═══
+# OpenClaw writes rich JSONL sessions (need formatting to .md); Copilot's `-p`
+# output is already human-readable text teed into the per-attempt logs. Both are
+# copied into RUN_OUTPUT_DIR as session_* so upload_results_github.py picks them up.
 OPENCLAW_SESSIONS_DIR="${OPENCLAW_SESSIONS_DIR:-/root/.openclaw/agents/main/sessions}"
 if [[ -d "${OPENCLAW_SESSIONS_DIR}" ]]; then
     _session_count=0
@@ -380,9 +385,56 @@ if [[ -d "${OPENCLAW_SESSIONS_DIR}" ]]; then
     fi
 fi
 
+# Copilot backend fallback: if run_copilot_fix could not export native transcripts
+# (session_copilot_*.md already present when it did), synthesize readable md from the
+# per-attempt logs so something is always uploaded.
+_agent_fixes_dir="${RUN_OUTPUT_DIR}/logs/agent_fixes"
+if [[ -d "${_agent_fixes_dir}" ]] && ! compgen -G "${RUN_OUTPUT_DIR}/session_copilot_*.md" >/dev/null 2>&1; then
+    _cp_sessions=0
+    for _phase_dir in "${_agent_fixes_dir}"/*/; do
+        [[ -d "${_phase_dir}" ]] || continue
+        _phase_name="$(basename "${_phase_dir}")"
+        _attempts=("${_phase_dir}"/attempt_*.log)
+        [[ -f "${_attempts[0]}" ]] || continue
+        _out="${RUN_OUTPUT_DIR}/session_copilot_${_phase_name}.md"
+        {
+            echo "# Copilot agent session — phase: ${_phase_name}"
+            echo
+            for _a in "${_attempts[@]}"; do
+                [[ -f "${_a}" ]] || continue
+                echo "## $(basename "${_a}" .log)"
+                echo
+                echo '```'
+                cat "${_a}"
+                echo '```'
+                echo
+            done
+        } > "${_out}" 2>/dev/null && ((_cp_sessions++)) || true
+    done
+    [[ ${_cp_sessions} -gt 0 ]] && log_info "Collected ${_cp_sessions} copilot session transcript(s) [fallback]"
+fi
+
+
+# ═══ Synthesize run narrative (tried-solutions summary + recipe/report narrative) ═══
+# Cheap-tier agent reads the fix attempts and writes resolution_summary.md.
+synthesize_run_summary "${RUN_OUTPUT_DIR}" "${PIPELINE_STATUS}" || log_warn "Synthesis failed (non-fatal)"
+
 # ═══ Generate Report (before upload so it gets included) ═══
 log_info "Generating run report..."
 python3 "${PHASES_DIR}/generate_report.py" "${RUN_OUTPUT_DIR}" || log_warn "Report generation failed (non-fatal)"
+
+# ═══ Generate reusable Recipe (ONLY when quantization AND evaluation both succeeded) ═══
+# A recipe is a deliverable for a fully-successful model: it documents the exact
+# scheme/method/ignore_layers/layer_config/export + accuracy so the result is
+# reproducible. It is written to the run dir and uploaded to GitHub with the results.
+if [[ "${PIPELINE_STATUS}" == "Finished" ]]; then
+    log_info "Generating quantization recipe (quant + eval succeeded)..."
+    _narrative_arg=()
+    [[ -f "${RUN_OUTPUT_DIR}/resolution_summary.md" ]] && _narrative_arg=(--narrative "${RUN_OUTPUT_DIR}/resolution_summary.md")
+    python3 "${PHASES_DIR}/generate_recipe.py" "${RUN_OUTPUT_DIR}" \
+        "${_narrative_arg[@]}" \
+        || log_warn "Recipe generation failed (non-fatal)"
+fi
 
 # ═══ Phase 4: Upload ═══
 if [[ "$SKIP_UPLOAD" != "true" ]]; then

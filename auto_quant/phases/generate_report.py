@@ -162,6 +162,20 @@ def generate_report(run_dir: Path) -> str:
     lines.append(f"| Quant Duration | {format_duration(duration)} |")
     lines.append("")
 
+    # Agent-synthesized narrative (resolution summary), if present — placed near the
+    # top for high visibility. This is the G6 narrative layer on top of the facts.
+    summary_md = run_dir / "resolution_summary.md"
+    if summary_md.exists():
+        try:
+            text = summary_md.read_text().strip()
+        except Exception:
+            text = ""
+        if text:
+            lines.append("## Summary & Root Cause")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
+
     # Evaluation results
     lines.append("## Evaluation Results")
     lines.append("")

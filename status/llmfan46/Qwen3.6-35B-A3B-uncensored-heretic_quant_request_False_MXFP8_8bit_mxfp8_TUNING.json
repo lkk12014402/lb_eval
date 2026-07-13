@@ -25,7 +25,7 @@
     "gpu_nums": 1,
     "method": "TUNING",
     "script": "auto_quant",
-    "status": "Failed",
+    "status": "Running",
     "submitted_time": "2026-07-10T01:41:50Z",
     "submitted_by": "Don-oz",
     "submitted_orgs": [],
@@ -41,6 +41,5 @@
     "downloads": 0,
     "created_at": "",
     "ci_run_id": 67792,
-    "triggered_time": "2026-07-10T03:06:55Z",
-    "notification_sent": true
+    "triggered_time": "2026-07-10T03:06:55Z"
 }

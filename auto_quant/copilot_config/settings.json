@@ -1,0 +1,12 @@
+{
+  "model": "claude-opus-4.8",
+  "effortLevel": "high",
+  "contextTier": "long_context",
+  "allowedUrls": [
+    "https://huggingface.co",
+    "https://api.github.com",
+    "https://raw.githubusercontent.com",
+    "https://objects.githubusercontent.com",
+    "https://pytorch.org"
+  ]
+}

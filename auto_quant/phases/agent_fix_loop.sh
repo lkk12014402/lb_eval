@@ -18,6 +18,10 @@
 [[ -n "${_AGENT_FIX_LOOP_SOURCED:-}" ]] && return 0
 _AGENT_FIX_LOOP_SOURCED=1
 
+# Pluggable agent backends (run_agent_fix dispatcher: openclaw | copilot).
+# Sourced here so the fix loop only depends on the run_agent_fix abstraction.
+source "$(dirname "${BASH_SOURCE[0]}")/agent_backends.sh"
+
 MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-10}"
 LESSONS_DIR="${LESSONS_DIR:-${LB_EVAL_REPO_DIR:-$(dirname "$0")/../lessons}}"
 
@@ -205,6 +209,14 @@ agent_fix_loop() {
     local fix_log_dir="${RUN_OUTPUT_DIR}/logs/agent_fixes/${phase_name}"
     mkdir -p "$(dirname "${phase_log}")" "${fix_log_dir}"
 
+    # ── Escalation ladder state ──
+    # Start at tier 0 (cheapest, e.g. MiniMax); escalate to stronger tiers (e.g.
+    # Opus) when a tier stalls (drift) or the agent asks to escalate.
+    local tier_idx=0
+    local tier_count
+    tier_count=$(agent_tiers_count)
+    agent_tier_activate 0 || true
+
     # Reuse ONE agent session across all attempts for this phase so the agent keeps
     # memory of what it already tried and does not repeat failed fixes.
     local fix_session_id="fix_${phase_name}_$$_$(date +%s)"
@@ -273,9 +285,10 @@ agent_fix_loop() {
         local prompt_file="${fix_log_dir}/prompt_${attempt}.txt"
         printf '%s\n' "${fix_prompt}" > "${prompt_file}"
 
-        # 6. Call OpenClaw agent (same session across attempts → retains memory)
+        # 6. Call the agent (backend chosen by AGENT_BACKEND; same session id
+        #    across attempts so backends that support memory can use it).
         local agent_log="${fix_log_dir}/attempt_${attempt}.log"
-        run_openclaw_fix "${fix_prompt}" "${agent_log}" "${fix_session_id}" || true
+        run_agent_fix "${fix_prompt}" "${agent_log}" "${fix_session_id}" || true
 
         # Capture the agent's FULL structured diagnosis (analysis + fix) as JSON so every
         # lesson we write below carries the agent's ROOT_CAUSE / COMPONENT / EVIDENCE /
@@ -283,14 +296,35 @@ agent_fix_loop() {
         local agent_analysis_json
         agent_analysis_json=$(extract_agent_analysis "${agent_log}")
 
-        # 6b. Early stop: agent declared this failure UNFIXABLE → don't waste retries
+        # 6b. Early stop: agent declared this failure UNFIXABLE → don't waste retries.
+        # BUT if a stronger tier is still available, escalate first — a stronger
+        # model may fix what a cheaper one called unfixable.
         if grep -aiE 'VERDICT:[[:space:]*]*UNFIXABLE' "${agent_log}" >/dev/null 2>&1; then
             local unfix_reason
             unfix_reason=$(extract_agent_field "${agent_log}" "UNFIXABLE_REASON")
             unfix_reason="${unfix_reason:-declared UNFIXABLE by agent}"
-            log_warn "Agent verdict: UNFIXABLE (${unfix_reason}). Aborting fix loop."
+            if [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+                tier_idx=$((tier_idx + 1))
+                log_warn "Tier $((tier_idx-1)) verdict UNFIXABLE (${unfix_reason}) → ESCALATING to tier ${tier_idx} before giving up"
+                agent_tier_activate "${tier_idx}" || true
+                drift_count=0
+                prev_eff_class=""
+                continue
+            fi
+            log_warn "Agent verdict: UNFIXABLE (${unfix_reason}) and no stronger tier left. Aborting fix loop."
             save_lesson "${phase_name}" "${error_tail}" "unfixable" "UNFIXABLE: ${unfix_reason}" "${agent_analysis_json}"
             return 1
+        fi
+
+        # 6b-2. Explicit escalation request: agent says a stronger model is needed.
+        if grep -aiE 'VERDICT:[[:space:]*]*ESCALATE' "${agent_log}" >/dev/null 2>&1 \
+           && [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+            tier_idx=$((tier_idx + 1))
+            log_warn "Agent requested ESCALATE → moving to tier ${tier_idx}"
+            agent_tier_activate "${tier_idx}" || true
+            drift_count=0
+            prev_eff_class=""
+            continue
         fi
 
         # 6a. Drift / progress detection — 3-layer signal:
@@ -327,9 +361,19 @@ agent_fix_loop() {
                 drift_count=$((drift_count + 1))
                 log_warn "Same error as previous attempt (class='${eff_class}', streak=${drift_count}/${DRIFT_THRESHOLD:-2})"
                 if [ "${drift_count}" -ge "${DRIFT_THRESHOLD:-2}" ]; then
-                    log_warn "Drift: error unchanged across ${drift_count} fixes. Aborting fix loop."
-                    save_lesson "${phase_name}" "${error_tail}" "drift" "Stuck on '${eff_class}' for ${drift_count} attempts (agent_class='${agent_class:-none}')" "${agent_analysis_json}"
-                    break
+                    # Stalled on this tier. Escalate to a stronger model if one is
+                    # available; otherwise give up (original behavior).
+                    if [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+                        tier_idx=$((tier_idx + 1))
+                        log_warn "Drift on tier $((tier_idx-1)): stuck on '${eff_class}' for ${drift_count} attempts → ESCALATING to tier ${tier_idx}"
+                        agent_tier_activate "${tier_idx}" || true
+                        drift_count=0
+                        prev_eff_class=""   # fresh start for the stronger model
+                    else
+                        log_warn "Drift: error unchanged across ${drift_count} fixes and no stronger tier left. Aborting fix loop."
+                        save_lesson "${phase_name}" "${error_tail}" "drift" "Stuck on '${eff_class}' for ${drift_count} attempts (agent_class='${agent_class:-none}')" "${agent_analysis_json}"
+                        break
+                    fi
                 fi
             elif [ "${same_error}" = "no" ]; then
                 [ "${drift_count}" -gt 0 ] && log_info "Error changed ('${prev_eff_class}' → '${eff_class}') — fix made progress"
@@ -440,10 +484,19 @@ ${lessons_section}
 
 ## MANDATORY PROTOCOL — fill this out BEFORE editing or installing anything
 
-Use the \`error_analysis\` skill methodology: read the traceback BOTTOM-UP, locate the
-EXACT file:line, then classify the failing component. You MUST print the block below
-FIRST. Do NOT modify code or install packages until you have printed an EVIDENCE_RESULT
-from a READ-ONLY command that actually supports your hypothesis. No guessing.
+Debug like a senior engineer (this methodology is self-contained — follow it regardless of backend):
+  1. ATTRIBUTE the bug first: whose layer owns it — our code / a dep (transformers, auto_round,
+     torch) / the model's own code / the data / the environment? The owner dictates where the fix goes.
+  2. Read the traceback BOTTOM-UP: the last exception is where it died; trace UP to the EXACT
+     file:line that is the real cause (skip warnings that have a fallback — they are not the crash).
+  3. VERIFY against the real artifact before touching anything: inspect the actual config / weight
+     names / dtype / installed version with a READ-ONLY command. Never fix from memory or a guess.
+  4. Reason about whether the needed data physically exists: if no option can succeed (the required
+     data isn't there), it must be regenerated upstream — a config tweak can't help.
+  5. Fix the NARROWEST layer; prefer the lowest FIX_TIER; then smoke-test before the full re-run.
+
+You MUST print the block below FIRST. Do NOT modify code or install packages until you have printed
+an EVIDENCE_RESULT from a READ-ONLY command that actually supports your hypothesis. No guessing.
 
 COMPONENT: <our_code|transformers|auto_round|torch|model_code|data|environment>
 ERROR_CLASS: <ONE stable snake_case token naming THIS error's category. Reuse the taxonomy
@@ -454,7 +507,7 @@ ERROR_CLASS: <ONE stable snake_case token naming THIS error's category. Reuse th
 ROOT_CAUSE_HYPOTHESIS: <one falsifiable sentence — the specific cause, NOT "maybe a version issue">
 EVIDENCE_CMD: <a single read-only command that verifies the hypothesis>
 EVIDENCE_RESULT: <paste the command's output>
-VERDICT: <FIXABLE | UNFIXABLE>
+VERDICT: <FIXABLE | UNFIXABLE | ESCALATE>
 UNFIXABLE_REASON: <required only if UNFIXABLE: e.g. multimodal-unsupported / corrupt weights / needs torch downgrade>
 FIX_TIER: <config | upgrade | workaround | patch>   # always try the LOWEST tier that works
 FIX_PLAN: <3 lines max — what you will change and why it fixes the ROOT CAUSE (not the symptom)>
@@ -462,6 +515,9 @@ SMOKE_TEST: <ONE fast command (NOT the full phase) that proves the fix works, e.
 
 ## Rules for this protocol:
 - If VERDICT is UNFIXABLE: print the block and STOP. Do NOT attempt a fix. The pipeline will halt this phase (no wasted retries).
+- If you are confident the fix needs a MORE CAPABLE model than the one you are (deep multi-file
+  reasoning, subtle mixed-precision layout, hard custom-model patch), set VERDICT: ESCALATE and STOP.
+  A stronger model will take over with your notes. Only escalate with a clear reason — don't punt easy fixes.
 - Prefer the LOWEST FIX_TIER. Patching source code is a last resort.
 - Escalate tiers only with evidence that the lower tier cannot work.
 - After applying the fix, RUN your SMOKE_TEST yourself and show its output before finishing.
@@ -506,71 +562,6 @@ Fix: Edit that file, change \`.float()\` to \`.to(proj.dtype)\`
 - Working directory: ${RUN_OUTPUT_DIR}
 - Model: ${MODEL_ID}
 PROMPT
-}
-
-# ═══════════════════════════════════════════════════════════════════
-# run_openclaw_fix — call OpenClaw agent with the fix prompt
-# ═══════════════════════════════════════════════════════════════════
-run_openclaw_fix() {
-    local prompt="$1"
-    local log_file="$2"
-    local session_id_arg="${3:-}"
-
-    if ! command -v openclaw >/dev/null 2>&1; then
-        log_warn "openclaw not found, skipping agent fix"
-        echo "openclaw not available" > "${log_file}"
-        return 1
-    fi
-
-    local timeout="${AGENT_TIMEOUT:-600}"
-    local session_id="${session_id_arg:-fix_${phase_name:-unknown}_$$_$(date +%s)}"
-    local sessions_dir="${OPENCLAW_SESSIONS_DIR:-/root/.openclaw/agents/main/sessions}"
-    local session_file="${sessions_dir}/${session_id}.jsonl"
-
-    log_info "Calling openclaw agent (session=${session_id}, timeout=${timeout}s)..."
-    log_info "  Session file: ${session_file}"
-
-    # Background progress reporter — prints elapsed time + session size every 30s
-    local _progress_pid=""
-    (
-        local _start=$SECONDS
-        while true; do
-            sleep 30
-            local elapsed=$(( SECONDS - _start ))
-            local session_lines=0
-            [[ -f "${session_file}" ]] && session_lines=$(wc -l < "${session_file}" 2>/dev/null || echo 0)
-            log_info "  [agent running ${elapsed}s] session: ${session_lines} messages"
-        done
-    ) &
-    _progress_pid=$!
-
-    timeout "${timeout}" openclaw agent --local \
-        --session-id "${session_id}" \
-        --message "${prompt}" \
-        --timeout "${timeout}" \
-        2>&1 | tee "${log_file}" || {
-        local rc=$?
-        if [ $rc -eq 124 ]; then
-            echo "[TIMEOUT] Agent exceeded ${timeout}s" >> "${log_file}"
-            log_warn "Agent timed out after ${timeout}s"
-        fi
-    }
-
-    # Stop progress reporter
-    if [[ -n "${_progress_pid}" ]]; then
-        kill "${_progress_pid}" 2>/dev/null || true
-        wait "${_progress_pid}" 2>/dev/null || true
-    fi
-
-    # Print session summary to auto.log
-    if [[ -f "${session_file}" ]]; then
-        local msg_count tool_count
-        msg_count=$(grep -c '"type":"message"\|"type": "message"' "${session_file}" 2>/dev/null || echo 0)
-        tool_count=$(grep -c '"tool_use"\|"tool_call"' "${session_file}" 2>/dev/null || echo 0)
-        log_info "  Agent session complete: ${msg_count} messages, ${tool_count} tool calls"
-    fi
-
-    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════

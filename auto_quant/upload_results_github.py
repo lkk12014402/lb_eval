@@ -105,75 +105,6 @@ def run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Comple
     )
 
 
-def hard_sync_to_remote(repo_dir: Path, pull_target: str, branch: str) -> bool:
-    """Force the local repo to exactly match the remote branch tip.
-
-    Robustly recovers from any leftover state a prior run may have left behind:
-      * aborts an in-progress rebase/merge,
-      * clears staged / unmerged index entries,
-      * discards ALL local modifications to tracked files — including edits the
-        agent fix-loop made under auto_quant/ (which must never be committed and
-        which otherwise block ``git pull``).
-
-    Untracked files (e.g. result artifacts we are about to stage, and gitignored
-    caches) are preserved, so it is safe to call before staging. Returns True on
-    success.
-    """
-    run_git(["rebase", "--abort"], repo_dir, check=False)
-    run_git(["merge", "--abort"], repo_dir, check=False)
-    run_git(["reset", "--hard"], repo_dir, check=False)
-    fetch = run_git(["fetch", pull_target, branch], repo_dir, check=False)
-    if fetch.returncode != 0:
-        print(f"[github-upload] hard-sync fetch failed:\n{fetch.stderr.strip()}")
-        return False
-    reset = run_git(["reset", "--hard", "FETCH_HEAD"], repo_dir, check=False)
-    if reset.returncode != 0:
-        print(f"[github-upload] hard-sync reset failed:\n{reset.stderr.strip()}")
-        return False
-    return True
-
-
-def snapshot_lessons(lessons_dir: Path) -> dict:
-    """Read this run's lesson jsonl files into memory BEFORE any git reset.
-
-    LESSONS_DIR is auto_quant/lessons *inside* the repo and is git-tracked, so a
-    ``git reset --hard`` during sync would revert it. We snapshot first, then union
-    the lines back in after syncing (see ``merge_lessons_into_repo``).
-    """
-    snap: dict[str, list[str]] = {}
-    if lessons_dir and lessons_dir.is_dir():
-        for f in sorted(lessons_dir.glob("*.jsonl")):
-            try:
-                snap[f.name] = f.read_text(encoding="utf-8").splitlines()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[github-upload] WARNING: could not read lessons {f}: {exc}")
-    return snap
-
-
-def merge_lessons_into_repo(repo_dir: Path, snapshot: dict, copied: list) -> None:
-    """Union our run's lesson lines into the repo's freshly-synced lessons.
-
-    Preserves lines already present on the remote (concurrent runs) and appends our
-    new ones — a line-level union that is safe for append-only jsonl logs. Only
-    ``auto_quant/lessons/`` is written; no other auto_quant/ path is ever touched.
-    """
-    if not snapshot:
-        return
-    dst_dir = repo_dir / "auto_quant" / "lessons"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for name, our_lines in snapshot.items():
-        dst = dst_dir / name
-        existing = dst.read_text(encoding="utf-8").splitlines() if dst.exists() else []
-        seen = set(existing)
-        merged = list(existing)
-        for line in our_lines:
-            if line and line not in seen:
-                merged.append(line)
-                seen.add(line)
-        dst.write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
-        copied.append(str(dst))
-
-
 def clone_repo(repo_url: str, target_dir: Path) -> None:
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
@@ -402,12 +333,7 @@ def detect_artifact_name(model_id: str, scheme: str, quant_summary: dict | None,
         return sanitize_name(model_short)
     # Build name matching HF_REPO_NAME format: {model}-AutoRound-{SCHEME}-{METHOD_SUFFIX}
     method_upper = (method or "RTN").strip().upper()
-    if method_upper == "TUNING":
-        method_suffix = "Tuning"
-    elif method_upper in ("MODEL_FREE", "MODELFREE"):
-        method_suffix = "ModelFree"
-    else:
-        method_suffix = "RTN"
+    method_suffix = "Tuning" if method_upper == "TUNING" else "RTN"
     return sanitize_name(f"{model_short}-AutoRound-{scheme}-{method_suffix}")
 
 
@@ -555,162 +481,143 @@ def main() -> int:
     print(f"[github-upload] branch: {branch}")
     ensure_git_config(repo_dir, args.git_user_name, args.git_user_email)
     print(f"[github-upload] git user: {args.git_user_name} <{args.git_user_email}>")
-    remote_url = args.git_repo or run_git(["remote", "get-url", "origin"], repo_dir).stdout.strip()
-    auth_url = build_auth_url(remote_url, args.git_token or None)
-    pull_target = auth_url if args.git_token else "origin"
-    push_target = auth_url if args.git_token else "origin"
-
-    # Snapshot this run's lessons BEFORE any git reset — LESSONS_DIR is
-    # auto_quant/lessons *inside* the repo and tracked, so hard_sync would revert it.
-    lessons_snapshot = snapshot_lessons(Path(os.environ.get("LESSONS_DIR", "")))
-
     if not args.dry_run:
-        # Robustly discard any leftover local state (unmerged files from a prior
-        # failed run, and agent fix-loop edits to auto_quant/ *source* that must
-        # never be committed) and hard-sync to the remote tip before staging. Our
-        # artifacts are (re)materialised afterwards, so this is safe. Replaces a
-        # fragile `git pull --rebase` that hard-failed on "unmerged files".
-        if not hard_sync_to_remote(repo_dir, pull_target, branch):
-            print("[github-upload] ERROR: could not sync repo to remote before staging")
+        remote_url = args.git_repo or run_git(["remote", "get-url", "origin"], repo_dir).stdout.strip()
+        auth_url = build_auth_url(remote_url, args.git_token or None)
+        pull_target = auth_url if args.git_token else "origin"
+        push_target = auth_url if args.git_token else "origin"
+
+        pull_args = ["pull", "--rebase", pull_target, branch]
+        pull_result = run_git(pull_args, repo_dir, check=False)
+        if pull_result.returncode != 0:
+            print(f"[github-upload] ERROR: git pull failed:\n{pull_result.stderr.strip()}")
             return 1
 
     model_result_dir = repo_dir / "results" / org / artifact_name
+    run_dir = model_result_dir / f"run_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    copied: list[str] = []
+    copy_file(quant_summary_path, run_dir / "quant_summary.json", copied)
+    copy_file(summary_path, run_dir / "summary.json", copied)
+    copy_file(accuracy_path, run_dir / "accuracy.json", copied)
+    # Copy request JSON (original task input) for traceability
+    request_json_path = runtime_output_dir / "request.json"
+    copy_file(request_json_path, run_dir / "request.json", copied)
+    # Copy run report if it exists (generated by generate_report.py)
+    run_report_path = runtime_output_dir / "run_report.md"
+    copy_file(run_report_path, run_dir / "run_report.md", copied)
+    # Copy the recipe deliverable (quant+eval-successful models only) and the
+    # agent-synthesized resolution summary if present.
+    for deliverable in ("recipe.md", "recipe.json", "resolution_summary.md"):
+        src = runtime_output_dir / deliverable
+        if src.is_file():
+            copy_file(src, run_dir / deliverable, copied)
+    if quantize_script_path.is_file():
+        copy_file(quantize_script_path, run_dir / "quantize.py", copied)
+    elif legacy_quantize_script_path.is_file():
+        copy_file(legacy_quantize_script_path, run_dir / "quantize.py", copied)
+    for evaluation_script_path, target_name in evaluation_script_candidates:
+        if evaluation_script_path.is_file():
+            copy_file(evaluation_script_path, run_dir / target_name, copied)
+            break
+    copy_tree(lm_eval_results_dir, run_dir / "lm_eval_results", copied)
+    copy_tree(logs_dir, run_dir / "logs", copied)
+
+    # Ensure exec logs are preserved (they may be in logs/ already via copy_tree,
+    # but also check for them directly in runtime_output_dir in case logs_dir differs)
+    logs_target = run_dir / "logs"
+    logs_target.mkdir(parents=True, exist_ok=True)
+    for exec_log_name in ("quant_exec.log", "eval_exec.log", "auto.log"):
+        exec_log_src = runtime_output_dir / exec_log_name
+        exec_log_dst = logs_target / exec_log_name
+        if exec_log_src.is_file() and not exec_log_dst.exists():
+            copy_file(exec_log_src, exec_log_dst, copied)
+
+    # Copy failure diagnosis files if present
+    for diag_file in sorted(runtime_output_dir.glob("failure_diagnosis_*.json")):
+        copy_file(diag_file, run_dir / diag_file.name, copied)
+
+    for path in sorted(runtime_output_dir.glob("session_*.jsonl")):
+        copy_file_sanitized(path, run_dir / path.name, copied)
+    for path in sorted(runtime_output_dir.glob("session_*.md")):
+        copy_file_sanitized(path, run_dir / path.name, copied)
+
+    # Copy agent session artifacts from common locations (openclaw may write here)
+    for session_subdir_name in (".openclaw", ".agent_sessions"):
+        session_subdir = runtime_output_dir / session_subdir_name
+        if session_subdir.is_dir():
+            copy_tree(session_subdir, run_dir / session_subdir_name, copied)
+
+    aggregate = {
+        "status": derive_pipeline_status(quant_summary, accuracy),
+        "pipeline": args.pipeline or ("auto_quant" if quant_summary else "auto_eval"),
+        "model_id": args.model_id,
+        "artifact_name": artifact_name,
+        "request_filename": args.request_filename or None,
+        "generated_at": utc_now(),
+        "source_runtime_dir": str(runtime_output_dir),
+        "source_model_dir": str(model_output_dir) if model_output_dir else None,
+        "run_dir": str(run_dir.relative_to(repo_dir)),
+        "quant_summary": quant_summary,
+        "accuracy": accuracy,
+        "copied_files": [str(Path(path).relative_to(repo_dir)) for path in copied],
+    }
+    if aggregate["pipeline"] == "auto_quant":
+        aggregate["quant_num_gpus"] = args.quant_num_gpus or (
+            str(quant_summary.get("quant_num_gpus") or quant_summary.get("num_gpus"))
+            if isinstance(quant_summary, dict) and (quant_summary.get("quant_num_gpus") or quant_summary.get("num_gpus")) is not None
+            else None
+        )
+        aggregate["eval_num_gpus"] = args.eval_num_gpus or (
+            str(accuracy.get("eval_num_gpus") or accuracy.get("num_gpus"))
+            if isinstance(accuracy, dict) and (accuracy.get("eval_num_gpus") or accuracy.get("num_gpus")) is not None
+            else None
+        )
+    else:
+        aggregate["num_gpus"] = args.eval_num_gpus or args.quant_num_gpus or (
+            str(accuracy.get("num_gpus"))
+            if isinstance(accuracy, dict) and accuracy.get("num_gpus") is not None
+            else None
+        )
+    aggregate_path = model_result_dir / f"results_{timestamp}.json"
+    aggregate_path.write_text(json.dumps(aggregate, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    copied.append(str(aggregate_path))
+
+    # Generate failure digest for failed pipelines
+    generate_failure_digest(run_dir, quant_summary, accuracy)
+
+    # Write-back status to the original request file in status/
     pipeline_status = derive_pipeline_status(quant_summary, accuracy)
     print(f"[github-upload] Derived pipeline status: {pipeline_status}")
+    write_back_status(repo_dir, args.request_filename, pipeline_status, copied)
 
-    def _blocked_path(r: str) -> bool:
-        # Never commit auto_quant/ EXCEPT the lessons log.
-        return (r == "auto_quant" or r.startswith("auto_quant/")) and not r.startswith("auto_quant/lessons/")
+    # ═══ Copy lessons into repo (same commit as results) ═══
+    lessons_dir = Path(os.environ.get("LESSONS_DIR", ""))
+    if lessons_dir.is_dir():
+        repo_lessons_dir = repo_dir / "auto_quant" / "lessons"
+        repo_lessons_dir.mkdir(parents=True, exist_ok=True)
+        for jsonl_file in sorted(lessons_dir.glob("*.jsonl")):
+            dst = repo_lessons_dir / jsonl_file.name
+            shutil.copy2(jsonl_file, dst)
+            copied.append(str(dst))
+        print(f"[github-upload] Included lessons from {lessons_dir}")
 
-    def prepare_and_stage(do_stage: bool) -> list[str]:
-        """(Re)materialise all artifacts in the repo and stage ONLY our paths.
-
-        Idempotent — safe to re-run after a hard re-sync: result files use unique
-        run_<timestamp> paths, the status write-back is re-derived, and lessons are
-        re-unioned into the freshly-synced remote copy. Commits results/, status/
-        and auto_quant/lessons/ only; agent edits to auto_quant/ source are dropped.
-        """
-        run_dir = model_result_dir / f"run_{timestamp}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        copied: list[str] = []
-        copy_file(quant_summary_path, run_dir / "quant_summary.json", copied)
-        copy_file(summary_path, run_dir / "summary.json", copied)
-        copy_file(accuracy_path, run_dir / "accuracy.json", copied)
-        # Copy request JSON (original task input) for traceability
-        request_json_path = runtime_output_dir / "request.json"
-        copy_file(request_json_path, run_dir / "request.json", copied)
-        # Copy run report if it exists (generated by generate_report.py)
-        run_report_path = runtime_output_dir / "run_report.md"
-        copy_file(run_report_path, run_dir / "run_report.md", copied)
-        if quantize_script_path.is_file():
-            copy_file(quantize_script_path, run_dir / "quantize.py", copied)
-        elif legacy_quantize_script_path.is_file():
-            copy_file(legacy_quantize_script_path, run_dir / "quantize.py", copied)
-        for evaluation_script_path, target_name in evaluation_script_candidates:
-            if evaluation_script_path.is_file():
-                copy_file(evaluation_script_path, run_dir / target_name, copied)
-                break
-        copy_tree(lm_eval_results_dir, run_dir / "lm_eval_results", copied)
-        copy_tree(logs_dir, run_dir / "logs", copied)
-
-        # Ensure exec logs are preserved (they may be in logs/ already via copy_tree,
-        # but also check for them directly in runtime_output_dir in case logs_dir differs)
-        logs_target = run_dir / "logs"
-        logs_target.mkdir(parents=True, exist_ok=True)
-        for exec_log_name in ("quant_exec.log", "eval_exec.log", "auto.log"):
-            exec_log_src = runtime_output_dir / exec_log_name
-            exec_log_dst = logs_target / exec_log_name
-            if exec_log_src.is_file() and not exec_log_dst.exists():
-                copy_file(exec_log_src, exec_log_dst, copied)
-
-        # Copy failure diagnosis files if present
-        for diag_file in sorted(runtime_output_dir.glob("failure_diagnosis_*.json")):
-            copy_file(diag_file, run_dir / diag_file.name, copied)
-
-        for path in sorted(runtime_output_dir.glob("session_*.jsonl")):
-            copy_file_sanitized(path, run_dir / path.name, copied)
-        for path in sorted(runtime_output_dir.glob("session_*.md")):
-            copy_file_sanitized(path, run_dir / path.name, copied)
-
-        # Copy agent session artifacts from common locations (openclaw may write here)
-        for session_subdir_name in (".openclaw", ".agent_sessions"):
-            session_subdir = runtime_output_dir / session_subdir_name
-            if session_subdir.is_dir():
-                copy_tree(session_subdir, run_dir / session_subdir_name, copied)
-
-        aggregate = {
-            "status": derive_pipeline_status(quant_summary, accuracy),
-            "pipeline": args.pipeline or ("auto_quant" if quant_summary else "auto_eval"),
-            "model_id": args.model_id,
-            "artifact_name": artifact_name,
-            "request_filename": args.request_filename or None,
-            "generated_at": utc_now(),
-            "source_runtime_dir": str(runtime_output_dir),
-            "source_model_dir": str(model_output_dir) if model_output_dir else None,
-            "run_dir": str(run_dir.relative_to(repo_dir)),
-            "quant_summary": quant_summary,
-            "accuracy": accuracy,
-            "copied_files": [str(Path(path).relative_to(repo_dir)) for path in copied],
-        }
-        if aggregate["pipeline"] == "auto_quant":
-            aggregate["quant_num_gpus"] = args.quant_num_gpus or (
-                str(quant_summary.get("quant_num_gpus") or quant_summary.get("num_gpus"))
-                if isinstance(quant_summary, dict) and (quant_summary.get("quant_num_gpus") or quant_summary.get("num_gpus")) is not None
-                else None
-            )
-            aggregate["eval_num_gpus"] = args.eval_num_gpus or (
-                str(accuracy.get("eval_num_gpus") or accuracy.get("num_gpus"))
-                if isinstance(accuracy, dict) and (accuracy.get("eval_num_gpus") or accuracy.get("num_gpus")) is not None
-                else None
-            )
-        else:
-            aggregate["num_gpus"] = args.eval_num_gpus or args.quant_num_gpus or (
-                str(accuracy.get("num_gpus"))
-                if isinstance(accuracy, dict) and accuracy.get("num_gpus") is not None
-                else None
-            )
-        aggregate_path = model_result_dir / f"results_{timestamp}.json"
-        aggregate_path.write_text(json.dumps(aggregate, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        copied.append(str(aggregate_path))
-
-        # Generate failure digest for failed pipelines
-        generate_failure_digest(run_dir, quant_summary, accuracy)
-
-        # Write-back status to the original request file in status/ (fresh remote content)
-        write_back_status(repo_dir, args.request_filename, pipeline_status, copied)
-
-        # Lessons: commit the run's lesson updates (line-union with the remote log),
-        # but nothing else under auto_quant/.
-        merge_lessons_into_repo(repo_dir, lessons_snapshot, copied)
-
-        rel_paths = [str(Path(path).relative_to(repo_dir)) for path in copied]
-        blocked = [r for r in rel_paths if _blocked_path(r)]
-        if blocked:
-            print(f"[github-upload] Skipping {len(blocked)} auto_quant/ code/script path(s) — never committed:")
-            for r in blocked:
-                print(f"    - {r}")
-        rel_paths = [r for r in rel_paths if not _blocked_path(r)]
-        if do_stage and rel_paths:
-            # --force to override .gitignore (e.g. *.log files must be uploaded)
-            run_git(["add", "--force", *rel_paths], repo_dir)
-        return rel_paths
+    rel_paths = [str(Path(path).relative_to(repo_dir)) for path in copied]
+    if not rel_paths:
+        print("[github-upload] No artifacts found to upload.")
+        return 0
 
     if args.dry_run:
-        rel_paths = prepare_and_stage(do_stage=False)
-        if not rel_paths:
-            print("[github-upload] No artifacts found to upload.")
-            return 0
         print("[github-upload] Dry run prepared artifacts:")
         for rel_path in rel_paths:
             print(f"  - {rel_path}")
         return 0
 
-    rel_paths = prepare_and_stage(do_stage=True)
-    if not rel_paths:
-        print("[github-upload] No artifacts found to upload.")
-        return 0
-    if run_git(["diff", "--cached", "--quiet"], repo_dir, check=False).returncode == 0:
+    # Use --force to override .gitignore (e.g. *.log files must be uploaded)
+    run_git(["add", "--force", *rel_paths], repo_dir)
+    diff_result = run_git(["diff", "--cached", "--quiet"], repo_dir, check=False)
+    if diff_result.returncode == 0:
         print("[github-upload] No changes to commit.")
         return 0
 
@@ -718,22 +625,21 @@ def main() -> int:
         f"Add auto_quant artifacts for {artifact_name}\n\n"
         "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
     )
-    if run_git(["commit", "-m", commit_message], repo_dir, check=False).returncode != 0:
-        print("[github-upload] ERROR: git commit failed")
+    commit_result = run_git(["commit", "-m", commit_message], repo_dir, check=False)
+    if commit_result.returncode != 0:
+        print(f"[github-upload] ERROR: git commit failed:\n{commit_result.stderr.strip()}")
         return 1
 
-    # Push with retry. On a concurrent-push conflict, hard-sync to the new remote
-    # tip and re-materialise our artifacts on top (unique result paths, re-derived
-    # status, re-unioned lessons), then re-commit and retry. No manual conflict
-    # resolution needed — the only mutable shared files (status, lessons) are
-    # regenerated against the fresh remote each attempt.
+    # Push with retry: if another container pushed first, pull --rebase and retry.
     max_retries = 5
     for attempt in range(1, max_retries + 1):
-        push_result = run_git(["push", push_target, f"HEAD:{branch}"], repo_dir, check=False)
+        push_args = ["push", push_target, f"HEAD:{branch}"]
+        push_result = run_git(push_args, repo_dir, check=False)
         if push_result.returncode == 0:
             break
 
         stderr = push_result.stderr.strip()
+        # Only retry on non-fast-forward / concurrent push conflicts
         is_conflict = any(hint in stderr.lower() for hint in [
             "non-fast-forward", "fetch first", "stale info",
             "failed to push", "cannot lock ref",
@@ -742,20 +648,24 @@ def main() -> int:
             print(f"[github-upload] ERROR: git push failed (attempt {attempt}/{max_retries}):\n{stderr}")
             return 1
 
-        wait = min(2 ** attempt, 30)
-        print(f"[github-upload] Push conflict (attempt {attempt}/{max_retries}), re-syncing in {wait}s ...")
+        wait = 2 ** attempt  # 2, 4, 8, 16, 32 seconds
+        print(f"[github-upload] Push conflict (attempt {attempt}/{max_retries}), "
+              f"retrying in {wait}s after pull --rebase ...")
         time.sleep(wait)
 
-        if not hard_sync_to_remote(repo_dir, pull_target, branch):
-            print("[github-upload] ERROR: re-sync after push conflict failed")
-            return 1
-        rel_paths = prepare_and_stage(do_stage=True)
-        if not rel_paths or run_git(["diff", "--cached", "--quiet"], repo_dir, check=False).returncode == 0:
-            print("[github-upload] Nothing new to push after re-sync.")
-            return 0
-        if run_git(["commit", "-m", commit_message], repo_dir, check=False).returncode != 0:
-            print("[github-upload] ERROR: git commit failed after re-sync")
-            return 1
+        rebase_result = run_git(["pull", "--rebase", pull_target, branch], repo_dir, check=False)
+        if rebase_result.returncode != 0:
+            # Rebase conflict — abort and retry with a fresh rebase
+            run_git(["rebase", "--abort"], repo_dir, check=False)
+            print(f"[github-upload] WARNING: rebase conflict, resetting and retrying ...")
+            # Reset to remote state, re-apply our changes
+            run_git(["fetch", pull_target, branch], repo_dir, check=False)
+            run_git(["reset", "--hard", f"FETCH_HEAD"], repo_dir, check=False)
+            # Re-stage and re-commit all our artifact files
+            run_git(["add", *rel_paths], repo_dir, check=False)
+            recommit = run_git(["diff", "--cached", "--quiet"], repo_dir, check=False)
+            if recommit.returncode != 0:
+                run_git(["commit", "-m", commit_message], repo_dir, check=False)
 
     print("[github-upload] Uploaded artifacts:")
     for rel_path in rel_paths:

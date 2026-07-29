@@ -1,0 +1,1125 @@
+#!/bin/bash
+# agent_fix_loop.sh — Sourceable library for the agent-assisted fix loop.
+#
+# Provides:
+#   agent_fix_loop <phase_name> <script_path> [args...]
+#   save_lesson <phase> <error_context> <status> <solution_note>
+#   search_lessons <phase> <error_text>
+#   maybe_compact_lessons
+#   push_lessons_to_git
+#
+# Required environment:
+#   RUN_OUTPUT_DIR    — base output dir for this run
+#   LESSONS_DIR       — path to lessons/ directory (git tracked)
+#   MAX_FIX_ATTEMPTS  — max agent retry attempts (default: 3)
+#   MODEL_ID, SCHEME, METHOD — for lesson metadata
+
+# Guard against double-source
+[[ -n "${_AGENT_FIX_LOOP_SOURCED:-}" ]] && return 0
+_AGENT_FIX_LOOP_SOURCED=1
+
+# Pluggable agent backends (run_agent_fix dispatcher: openclaw | copilot).
+# Sourced here so the fix loop only depends on the run_agent_fix abstraction.
+source "$(dirname "${BASH_SOURCE[0]}")/agent_backends.sh"
+
+MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-10}"
+LESSONS_DIR="${LESSONS_DIR:-${LB_EVAL_REPO_DIR:-$(dirname "$0")/../lessons}}"
+
+# ═══════════════════════════════════════════════════════════════════
+# cleanup_stale_gpu_procs — kill leftover phase worker processes that may still
+# be holding GPU memory, then wait for VRAM to actually release.
+#
+# Root cause this solves: after a phase fails (timeout / crash / agent-killed parent),
+# a child quantize.py/evaluate.py can be orphaned and keep ~all VRAM allocated. The
+# next run is then STARVED and silently falls back to CPU (hours of wasted compute).
+#
+# Safety: we match ONLY our own phase script paths, kill each PID explicitly (never by
+# name-broad signals), and never touch ourselves. Gated by CLEANUP_STALE_GPU (default on).
+# ═══════════════════════════════════════════════════════════════════
+cleanup_stale_gpu_procs() {
+    [ "${CLEANUP_STALE_GPU:-true}" = "true" ] || return 0
+
+    local self_pid=$$
+    local patterns=("phases/quantize.py" "phases/evaluate.py")
+    local killed=0 pat pid comm
+
+    for pat in "${patterns[@]}"; do
+        # pgrep only LISTS pids; killing is done explicitly per-PID below.
+        # Restrict to actual python worker processes: a bare -f match also hits our own
+        # shell / command-substitution subshells (their cmdline contains the pattern
+        # string) and the harness itself. Filtering comm=python* avoids killing them.
+        for pid in $(pgrep -f "${pat}" 2>/dev/null || true); do
+            [ "${pid}" = "${self_pid}" ] && continue
+            kill -0 "${pid}" 2>/dev/null || continue
+            comm=$(ps -o comm= -p "${pid}" 2>/dev/null | tr -d ' ')
+            case "${comm}" in
+                python|python3|python3.*) ;;
+                *) continue ;;
+            esac
+            log_warn "Stale GPU worker still alive: PID=${pid} (${pat}) — terminating"
+            kill "${pid}" 2>/dev/null || true
+            killed=$((killed + 1))
+        done
+    done
+
+    # Escalate any survivors after a grace period.
+    if [ "${killed}" -gt 0 ]; then
+        sleep 3
+        for pat in "${patterns[@]}"; do
+            for pid in $(pgrep -f "${pat}" 2>/dev/null || true); do
+                [ "${pid}" = "${self_pid}" ] && continue
+                kill -0 "${pid}" 2>/dev/null || continue
+                comm=$(ps -o comm= -p "${pid}" 2>/dev/null | tr -d ' ')
+                case "${comm}" in
+                    python|python3|python3.*) ;;
+                    *) continue ;;
+                esac
+                log_warn "PID=${pid} survived SIGTERM — sending SIGKILL"
+                kill -9 "${pid}" 2>/dev/null || true
+            done
+        done
+    fi
+
+    # Wait for VRAM to actually free up (best-effort; needs nvidia-smi).
+    command -v nvidia-smi >/dev/null 2>&1 || { [ "${killed}" -gt 0 ] && sleep 2; return 0; }
+    local min_free_mb="${MIN_FREE_VRAM_MB:-2048}"
+    local waited=0 max_wait="${GPU_FREE_WAIT_SEC:-30}" free_mb
+    while [ "${waited}" -lt "${max_wait}" ]; do
+        free_mb=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        [[ "${free_mb}" =~ ^[0-9]+$ ]] || break
+        if [ "${free_mb}" -ge "${min_free_mb}" ]; then
+            [ "${killed}" -gt 0 ] && log_ok "GPU VRAM released (${free_mb}MB free)"
+            return 0
+        fi
+        log_info "Waiting for VRAM to free (${free_mb}MB free, need ${min_free_mb}MB)..."
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 0
+}
+
+# Stable location of this library and the shared error taxonomy, so the harness can
+# REUSE the exact same deterministic classifier the post-mortem diagnosis uses.
+_AFL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ERROR_ANALYSIS_DIR="${ERROR_ANALYSIS_DIR:-${_AFL_DIR}/../error_analysis}"
+
+# ═══════════════════════════════════════════════════════════════════
+# taxonomy_classify — L1 deterministic classification, REUSING error_analysis/taxonomy.py
+#   (the same classify_error() the post-mortem diagnosis uses — single source of truth).
+#   Reads an error-log file; prints:
+#     line 1           : the taxonomy category token (or "unknown")
+#     lines 2..N       : a ready-to-embed "prior" block for the agent prompt
+#   This is a FAST, high-precision fast-path — it is NOT expected to cover every error.
+#   Long-tail coverage is the agent's job (L2); unknowns fall back to text similarity.
+# ═══════════════════════════════════════════════════════════════════
+taxonomy_classify() {
+    local errfile="$1"
+    python3 - "$errfile" "${ERROR_ANALYSIS_DIR}" <<'PY' 2>/dev/null || echo "unknown"
+import sys, os, re
+errfile, ea_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, ea_dir)
+try:
+    from taxonomy import classify_error
+except Exception:
+    print("unknown"); sys.exit(0)
+try:
+    text = open(errfile, encoding="utf-8", errors="replace").read()
+except OSError:
+    text = ""
+
+# D: pre-denoise volatile lines that taxonomy._strip_noise doesn't cover, so the same
+# underlying error classifies the SAME way across attempts (keeps drift detection stable
+# and stops a real traceback being crowded out of the classified window). We drop only
+# well-known NON-error chatter; classify_error() also denoises internally afterwards.
+_VOLATILE = [
+    r"A new version of the following files was downloaded",
+    r"Make sure to double-check they do not contain",
+    r"^\s*[-]\s+\w+\.py\s*$",                       # the file list under that warning
+    r"\d{3,} Client Error",                          # 404/5xx Client Error. (Request ID...)
+    r"Entry Not Found for url",
+    r"Request ID: Root=",
+    r"You are sending unauthenticated requests",
+    r"Generating [\w-]+ split:",                     # datasets progress bars
+    r"^(Map|Filter|Downloading|Resolving|Loading)[\w ]*:\s*\d+%",
+    r"\b\d+%\|[#█▉▊▋▌▍▎▏ ]*\|",                       # tqdm bars
+    r"falling back to in-process mode",              # subprocess→in-process banner
+    r"examples/s\]\s*$",                             # trailing rate of a progress bar
+]
+_vre = re.compile("|".join(_VOLATILE))
+text = "\n".join(l for l in text.splitlines() if not _vre.search(l)) or text
+
+cat, info = classify_error(text)
+print(cat)
+desc = info.get("description", "")
+guide = info.get("root_cause_guide", "")
+if isinstance(guide, (list, tuple)):
+    guide = " ".join(guide)
+hints = info.get("workaround_hints", []) or []
+print("- Category (pattern-based, MAY BE WRONG — verify or override): %s" % cat)
+if desc:  print("- Description: %s" % desc)
+if guide: print("- Root-cause guide: %s" % guide)
+if hints: print("- Workaround hints: %s" % "; ".join(hints))
+PY
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# logs_are_similar — L1.5 deterministic FALLBACK for drift when neither attempt got a
+#   confident category (both "unknown"). Works on ARBITRARY error text with zero
+#   enumeration: denoise (strip timestamps/HTTP/progress/paths, normalize numbers) then
+#   compare with difflib. Exit 0 = same error, 1 = different, 2 = cannot tell.
+# ═══════════════════════════════════════════════════════════════════
+logs_are_similar() {
+    python3 - "$1" "$2" "${DRIFT_SIM:-0.90}" <<'PY' 2>/dev/null
+import sys, re, difflib
+def denoise(p):
+    try:
+        t = open(p, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return ""
+    out = []
+    for ln in t.splitlines():
+        if re.search(r'HTTP Request|HTTP/1\.1|Client Error|Downloading|it/s\]|\|\s*\d+/\d+|Config was last written|allowlist contains|WARNING logging', ln):
+            continue
+        s = re.sub(r'^\S*\d{4}-\d\d-\d\dT[\d:.]+Z?\s*', '', ln)
+        s = re.sub(r'\b\d{1,2}:\d{2}:\d{2}\b', '', s)
+        s = re.sub(r'\[[A-Z]+\]', '', s)
+        s = re.sub(r'0x[0-9a-fA-F]+', '0xADDR', s)
+        s = re.sub(r'/[^\s:]+/', '/PATH/', s)
+        s = re.sub(r'\d+\.\d+\s?[GMK]i?B', 'SIZE', s)
+        s = re.sub(r'line \d+', 'line N', s)
+        s = re.sub(r'\d+', 'N', s)
+        s = s.strip()
+        if s:
+            out.append(s)
+    return "\n".join(out)
+a, b, thr = denoise(sys.argv[1]), denoise(sys.argv[2]), float(sys.argv[3])
+if not a or not b:
+    sys.exit(2)
+r = difflib.SequenceMatcher(None, a, b).ratio()
+sys.stderr.write("[drift] denoised similarity=%.3f (threshold=%.2f)\n" % (r, thr))
+sys.exit(0 if r >= thr else 1)
+PY
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# extract_progress — deepest quantized layer index seen in a log (else -1). Used as a
+#   "real progress" override: if the re-run got FURTHER than before, it is NOT drift
+#   even when the error class repeats.
+# ═══════════════════════════════════════════════════════════════════
+extract_progress() {
+    local n
+    n=$(grep -oE 'layers\.[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1)
+    printf '%s' "${n:--1}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# agent_fix_loop — run a phase script, retry with agent on failure
+# ═══════════════════════════════════════════════════════════════════
+agent_fix_loop() {
+    local phase_name="$1"
+    local script_path="$2"
+    shift 2
+    local script_args=("$@")
+
+    local max_attempts="${MAX_FIX_ATTEMPTS}"
+    local attempt=0
+    local prev_eff_class=""      # error class (agent's, else taxonomy's) from the previous attempt
+    local prev_errfile=""        # previous attempt's error-tail file (similarity fallback)
+    local drift_count=0          # consecutive attempts stuck on the same error class
+    local max_progress=-1        # deepest quant layer reached so far (progress override)
+    local phase_log="${RUN_OUTPUT_DIR}/logs/${phase_name}.log"
+    local fix_log_dir="${RUN_OUTPUT_DIR}/logs/agent_fixes/${phase_name}"
+    mkdir -p "$(dirname "${phase_log}")" "${fix_log_dir}"
+
+    # ── Escalation ladder state ──
+    # Start at tier 0 (cheapest, e.g. MiniMax); escalate to stronger tiers (e.g.
+    # Opus) when a tier stalls (drift) or the agent asks to escalate.
+    local tier_idx=0
+    local tier_count
+    tier_count=$(agent_tiers_count)
+    agent_tier_activate 0 || true
+    # Fail-safe budget: even if drift never fires (e.g. the agent can't produce a
+    # stable ERROR_CLASS, or keeps saying FIXABLE while looping), force an escalation
+    # after this many attempts on the SAME tier so the ladder always advances instead
+    # of burning every attempt on tier 0. Reset whenever we change tier.
+    local attempts_on_tier=0
+    local tier_attempt_budget="${TIER_ATTEMPT_BUDGET:-3}"
+
+    # Ensure the GLOBAL attempt cap is large enough for EVERY tier to actually get its
+    # budget — otherwise a cheap-but-broken tier 0 (e.g. an openclaw auth failure) burns
+    # the whole cap and the stronger tiers (copilot+MiniMax, copilot+Opus) never run. So
+    # scale up to tier_count × per-tier budget when the configured cap is smaller.
+    local _needed=$(( tier_count * tier_attempt_budget ))
+    if [ "${max_attempts}" -lt "${_needed}" ] 2>/dev/null; then
+        log_info "Raising fix-attempt cap ${max_attempts} → ${_needed} so all ${tier_count} tiers can run (budget ${tier_attempt_budget}/tier)"
+        max_attempts="${_needed}"
+    fi
+
+    # Reuse ONE agent session across all attempts for this phase so the agent keeps
+    # memory of what it already tried and does not repeat failed fixes.
+    local fix_session_id="fix_${phase_name}_$$_$(date +%s)"
+
+    # Snapshot whether CUDA was available BEFORE the fix loop. If it was, a fix that
+    # loses CUDA is a regression — we must refuse to silently quantize on CPU.
+    local cuda_was_available=false
+    if python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+        cuda_was_available=true
+        log_info "CUDA available at start — GPU will be enforced across fix attempts"
+    fi
+
+    # First execution (deterministic script). Clear any leftover GPU workers first so
+    # a leak from a prior phase/run can't starve this one onto CPU.
+    cleanup_stale_gpu_procs
+    log_step "Phase: ${phase_name}"
+    bash "${script_path}" "${script_args[@]}" 2>&1 | tee "${phase_log}"
+    local exit_code=${PIPESTATUS[0]}
+
+    if [ $exit_code -eq 0 ]; then
+        log_ok "${phase_name} succeeded"
+        return 0
+    fi
+
+    log_warn "${phase_name} failed (exit=${exit_code}), entering agent fix loop"
+
+    # Fix loop
+    while [ $attempt -lt $max_attempts ]; do
+        attempt=$((attempt + 1))
+        attempts_on_tier=$((attempts_on_tier + 1))
+
+        # Fail-safe escalation: if this tier has spent its whole attempt budget without
+        # fixing the phase, move to the next tier NOW — regardless of drift/verdict. This
+        # guarantees the ladder advances even when the agent never emits a stable
+        # ERROR_CLASS (drift can't fire) or keeps declaring FIXABLE while looping.
+        if [ "${attempts_on_tier}" -gt "${tier_attempt_budget}" ] && [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+            tier_idx=$((tier_idx + 1))
+            log_warn "Tier $((tier_idx-1)) used its ${tier_attempt_budget}-attempt budget without success → ESCALATING to tier ${tier_idx} (fail-safe)"
+            agent_tier_activate "${tier_idx}" || true
+            drift_count=0; prev_eff_class=""; attempts_on_tier=1
+        fi
+
+        log_step "Agent fix attempt ${attempt}/${max_attempts} for ${phase_name} (tier ${tier_idx}, ${attempts_on_tier}/${tier_attempt_budget})"
+
+        # 1. Extract error context and persist it to a per-attempt file (so drift can
+        #    compare attempt N vs N-1 by FILE — never a file against itself).
+        local error_tail errfile
+        errfile="${fix_log_dir}/errtail_${attempt}.txt"
+        error_tail=$(tail -100 "${phase_log}")
+        printf '%s\n' "${error_tail}" > "${errfile}"
+
+        # 2. L1 deterministic classification (REUSED taxonomy) → category + prior block.
+        #    The category seeds drift detection; the prior block makes the AGENT start
+        #    smarter (it gets the pattern-based guess + root-cause guide + hints, and is
+        #    told it MAY BE WRONG and should verify/override).
+        local classout cur_taxo_cat prior_block cur_progress
+        classout=$(taxonomy_classify "${errfile}")
+        cur_taxo_cat=$(printf '%s\n' "${classout}" | head -1)
+        prior_block=$(printf '%s\n' "${classout}" | tail -n +2)
+        cur_progress=$(extract_progress "${errfile}")
+        log_info "L1 pre-agent guess (pattern-based, may be wrong): ${cur_taxo_cat} (progress=layer ${cur_progress})"
+
+        # 3. Load all lessons for agent context
+        local lessons=""
+        if [ -d "${LESSONS_DIR}" ]; then
+            lessons=$(load_all_lessons 2>/dev/null || true)
+        fi
+        if [ -n "${lessons}" ]; then
+            log_info "Loaded lessons for agent (let agent decide relevance)"
+        else
+            log_info "No lessons available"
+        fi
+
+        # 4. Build agent prompt (now seeded with the L1 taxonomy prior). When we are at
+        #    the STRONGEST tier (opus is the last tier) and a patch-capture snapshot
+        #    exists, surface the accumulated changes earlier tiers already made so opus
+        #    REFINES/consolidates the patch (and classifies the root cause) instead of
+        #    starting from scratch. Gated to the top tier to save tokens.
+        local prior_diff=""
+        if [ $((tier_idx + 1)) -eq "${tier_count}" ] && [ "${tier_count}" -gt 1 ] \
+           && command -v patch_prior_diff >/dev/null 2>&1; then
+            prior_diff="$(patch_prior_diff 2>/dev/null || true)"
+            [ -n "${prior_diff}" ] && log_info "Opus tier: injecting prior-tier change diff for patch refinement"
+        fi
+        local fix_prompt
+        AGENT_PRIOR_DIFF="${prior_diff}" \
+            fix_prompt=$(build_fix_prompt "${phase_name}" "${error_tail}" "${lessons}" "${attempt}" "${prior_block}")
+
+        # 5. Save prompt for audit
+        local prompt_file="${fix_log_dir}/prompt_${attempt}.txt"
+        printf '%s\n' "${fix_prompt}" > "${prompt_file}"
+
+        # 6. Call the agent (backend chosen by AGENT_BACKEND; same session id
+        #    across attempts so backends that support memory can use it).
+        local agent_log="${fix_log_dir}/attempt_${attempt}.log"
+        run_agent_fix "${fix_prompt}" "${agent_log}" "${fix_session_id}" || true
+
+        # Capture the agent's FULL structured diagnosis (analysis + fix) as JSON so every
+        # lesson we write below carries the agent's ROOT_CAUSE / COMPONENT / EVIDENCE /
+        # FIX_TIER — not just a grep'd fix line. Feeds L3 self-learning.
+        local agent_analysis_json
+        agent_analysis_json=$(extract_agent_analysis "${agent_log}")
+        # At the strongest/opus tier, remember this analysis so the patch manifest can
+        # record WHY each captured patch exists + opus's component classification.
+        if [ $((tier_idx + 1)) -eq "${tier_count}" ] && [ "${tier_count}" -gt 1 ]; then
+            export OPUS_ANALYSIS_JSON="${agent_analysis_json}"
+        fi
+
+        # 6b. Read the agent's FINAL self-declared verdict (robust: ignores prose that
+        # merely mentions a token, the protocol menu, and any prompt text folded in).
+        local verdict
+        verdict=$(agent_verdict "${agent_log}")
+
+        # Early stop: agent declared this failure UNFIXABLE → don't waste retries.
+        # BUT if a stronger tier is still available, escalate first — a stronger
+        # model may fix what a cheaper one called unfixable.
+        if [ "${verdict}" = "unfixable" ]; then
+            local unfix_reason
+            unfix_reason=$(extract_agent_field "${agent_log}" "UNFIXABLE_REASON")
+            unfix_reason="${unfix_reason:-declared UNFIXABLE by agent}"
+            if [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+                tier_idx=$((tier_idx + 1))
+                log_warn "Tier $((tier_idx-1)) verdict UNFIXABLE (${unfix_reason}) → ESCALATING to tier ${tier_idx} before giving up"
+                agent_tier_activate "${tier_idx}" || true
+                drift_count=0
+                prev_eff_class=""
+                attempts_on_tier=0
+                continue
+            fi
+            log_warn "Agent verdict: UNFIXABLE (${unfix_reason}) and no stronger tier left. Aborting fix loop."
+            save_lesson "${phase_name}" "${error_tail}" "unfixable" "UNFIXABLE: ${unfix_reason}" "${agent_analysis_json}"
+            return 1
+        fi
+
+        # 6b-2. Explicit escalation request: agent says a stronger model is needed.
+        if [ "${verdict}" = "escalate" ] \
+           && [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+            tier_idx=$((tier_idx + 1))
+            log_warn "Agent requested ESCALATE → moving to tier ${tier_idx}"
+            agent_tier_activate "${tier_idx}" || true
+            drift_count=0
+            prev_eff_class=""
+            attempts_on_tier=0
+            continue
+        fi
+
+        # 6a. Drift / progress detection — 3-layer signal:
+        #   PRIMARY  : the AGENT's semantic ERROR_CLASS (covers the long tail / new errors)
+        #   FALLBACK : the L1 taxonomy category when the agent didn't emit a usable class
+        #   TIE-BREAK: denoised text similarity when BOTH classes are unknown/missing
+        #   OVERRIDE : deeper quant layer than before  → real progress, never drift
+        #   FAIL-SAFE: if we cannot tell, CONTINUE (a false abort is the expensive failure)
+        # We record the agent's class into the lesson (self-learning: recurring unknowns
+        # can later be promoted into the taxonomy).
+        local agent_class eff_class
+        agent_class=$(extract_agent_field "${agent_log}" "ERROR_CLASS" | awk '{print $1}' \
+            | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')
+        if [ -n "${agent_class}" ] && [ "${agent_class}" != "unknown" ]; then
+            eff_class="${agent_class}"      # PRIMARY: trust the agent's semantic label
+        else
+            eff_class="${cur_taxo_cat}"     # FALLBACK: deterministic taxonomy label
+        fi
+        log_info "Root-cause class (post-agent): ${eff_class} (from agent ERROR_CLASS='${agent_class:-none}', L1 guess='${cur_taxo_cat}')"
+
+        if [ "${cur_progress}" -gt "${max_progress}" ] 2>/dev/null; then
+            [ "${drift_count}" -gt 0 ] && log_info "Progress: reached layer ${cur_progress} (was ${max_progress}) — resetting drift"
+            drift_count=0
+        elif [ $attempt -gt 1 ]; then
+            local same_error=""   # yes | no | "" (unknown)
+            if [ -n "${eff_class}" ] && [ "${eff_class}" != "unknown" ] && [ -n "${prev_eff_class}" ] && [ "${prev_eff_class}" != "unknown" ]; then
+                [ "${eff_class}" = "${prev_eff_class}" ] && same_error="yes" || same_error="no"
+            elif [ -n "${prev_errfile}" ] && [ -f "${prev_errfile}" ]; then
+                logs_are_similar "${errfile}" "${prev_errfile}"; local sim_rc=$?
+                case "${sim_rc}" in 0) same_error="yes";; 1) same_error="no";; *) same_error="";; esac
+            fi
+
+            if [ "${same_error}" = "yes" ]; then
+                drift_count=$((drift_count + 1))
+                log_warn "Same error as previous attempt (class='${eff_class}', streak=${drift_count}/${DRIFT_THRESHOLD:-2})"
+                if [ "${drift_count}" -ge "${DRIFT_THRESHOLD:-2}" ]; then
+                    # Stalled on this tier. Escalate to a stronger model if one is
+                    # available; otherwise give up (original behavior).
+                    if [ $((tier_idx + 1)) -lt "${tier_count}" ]; then
+                        tier_idx=$((tier_idx + 1))
+                        log_warn "Drift on tier $((tier_idx-1)): stuck on '${eff_class}' for ${drift_count} attempts → ESCALATING to tier ${tier_idx}"
+                        agent_tier_activate "${tier_idx}" || true
+                        drift_count=0
+                        prev_eff_class=""   # fresh start for the stronger model
+                        attempts_on_tier=0
+                        # Give the stronger tier its OWN fresh attempt instead of
+                        # re-running the drifted fix (same-class error → won't pass).
+                        prev_errfile="${errfile}"
+                        continue
+                    else
+                        log_warn "Drift: error unchanged across ${drift_count} fixes and no stronger tier left. Aborting fix loop."
+                        save_lesson "${phase_name}" "${error_tail}" "drift" "Stuck on '${eff_class}' for ${drift_count} attempts (agent_class='${agent_class:-none}')" "${agent_analysis_json}"
+                        break
+                    fi
+                fi
+            elif [ "${same_error}" = "no" ]; then
+                [ "${drift_count}" -gt 0 ] && log_info "Error changed ('${prev_eff_class}' → '${eff_class}') — fix made progress"
+                drift_count=0
+            fi
+            # same_error == "" → FAIL-SAFE: neither abort nor reset; keep trying
+        fi
+        # Remember for the next iteration
+        [ -n "${eff_class}" ] && [ "${eff_class}" != "unknown" ] && prev_eff_class="${eff_class}"
+        prev_errfile="${errfile}"
+        [ "${cur_progress}" -gt "${max_progress}" ] 2>/dev/null && max_progress="${cur_progress}"
+
+        # 6c. GPU guard: a fix must NOT break CUDA. If GPU was available at start but is
+        # now gone, refuse to silently fall back to a slow/OOM-prone CPU quantization run.
+        # Feed the regression back so the agent restores CUDA on the next attempt.
+        if [ "${cuda_was_available}" = "true" ] && [ "${REQUIRE_CUDA:-true}" = "true" ]; then
+            if ! python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+                log_error "CUDA became UNAVAILABLE after agent fix (attempt ${attempt}) — refusing CPU re-run."
+                {
+                    echo "[harness] REGRESSION: torch.cuda.is_available() == False after your fix."
+                    echo "[harness] This box HAS a GPU. Your fix broke CUDA — most likely a CPU-only torch"
+                    echo "[harness] was installed, torch was reinstalled/downgraded, or CUDA_VISIBLE_DEVICES was cleared."
+                    echo "[harness] RESTORE CUDA before anything else: reinstall the matching CUDA torch wheel,"
+                    echo "[harness] unset/repair CUDA_VISIBLE_DEVICES, and verify: python3 -c 'import torch; assert torch.cuda.is_available()'"
+                } | tee -a "${agent_log}"
+                save_lesson "${phase_name}" "${error_tail}" "still_failing" "Fix broke CUDA (attempt ${attempt}); refused CPU re-run" "${agent_analysis_json}"
+                phase_log="${agent_log}"
+                continue
+            fi
+        fi
+
+        # 6d. Cheap smoke test before the expensive full phase re-run.
+        # run_smoke_test returns 0 if the smoke test passed OR none could be extracted
+        # (fall back to the normal full re-run); non-zero only if an extracted test failed.
+        if ! run_smoke_test "${agent_log}"; then
+            log_warn "Smoke test failed after agent fix (attempt ${attempt}); skipping full re-run."
+            save_lesson "${phase_name}" "${error_tail}" "still_failing" "Smoke test failed on attempt ${attempt}" "${agent_analysis_json}"
+            phase_log="${agent_log}"
+            continue
+        fi
+
+        # 7. Re-run phase script to verify
+        # Clean up any orphaned GPU workers from the failed attempt (or from the agent's
+        # own test runs) so this re-run isn't starved into a silent CPU fallback.
+        cleanup_stale_gpu_procs
+        log_info "Re-running ${phase_name} after agent fix..."
+        local retry_log="${fix_log_dir}/retry_${attempt}.log"
+        bash "${script_path}" "${script_args[@]}" 2>&1 | tee "${retry_log}"
+        exit_code=${PIPESTATUS[0]}
+
+        if [ $exit_code -eq 0 ]; then
+            log_ok "${phase_name} fixed on attempt ${attempt}"
+            # Extract agent's fix summary (first lines containing FIX_PLAN or actual commands)
+            local fix_summary=""
+            if [ -f "${agent_log}" ]; then
+                fix_summary=$(grep -A3 "FIX_PLAN\|Fix applied\|Installing\|pip install\|Changing\|Setting" "${agent_log}" | head -5 | tr '\n' '; ')
+            fi
+            fix_summary="${fix_summary:-Agent fixed on attempt ${attempt}}"
+            save_lesson "${phase_name}" "${error_tail}" "fixed" "${fix_summary}" "${agent_analysis_json}"
+            return 0
+        fi
+
+        phase_log="${retry_log}"
+        save_lesson "${phase_name}" "${error_tail}" "still_failing" "Attempt ${attempt} did not resolve" "${agent_analysis_json}"
+    done
+
+    log_error "${phase_name} failed after ${max_attempts} fix attempts"
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# build_fix_prompt — construct the agent prompt for fixing a phase
+# ═══════════════════════════════════════════════════════════════════
+build_fix_prompt() {
+    local phase="$1"
+    local error="$2"
+    local lessons="$3"
+    local attempt="${4:-1}"
+    local prior_block="${5:-}"
+
+    local lessons_section=""
+    if [ -n "${lessons}" ]; then
+        lessons_section="## Historical Lessons (from past runs — decide which are relevant):
+${lessons}
+Review the lessons above and apply the most relevant fix for the current error."
+    else
+        lessons_section="## Historical Lessons:
+No lessons available yet."
+    fi
+
+    local prior_section=""
+    if [ -n "${prior_block}" ]; then
+        prior_section="## Quick Classification (deterministic pattern match — a PRIOR, not the truth)
+${prior_block}
+Treat this as a starting hint. CONFIRM it against the traceback, and OVERRIDE it in your
+ERROR_CLASS below if it is wrong or if the category is \`unknown\`.
+"
+    fi
+
+    # Prior-tier changes (only injected at the strongest/opus tier). This turns the top
+    # tier into a patch-CONSOLIDATION stage: it sees what cheaper tiers already changed,
+    # refines it, and classifies whether the root cause is auto_round or elsewhere.
+    local prior_diff_section=""
+    if [ -n "${AGENT_PRIOR_DIFF:-}" ]; then
+        prior_diff_section="## Changes ALREADY made by earlier fix tiers (openclaw / copilot+MiniMax)
+You are the STRONGEST tier and the patch CONSOLIDATOR. The unified diff below is what
+earlier attempts already applied to the editable areas (auto_round source, the model's
+custom code, etc.). These changes are ON DISK right now.
+\`\`\`diff
+${AGENT_PRIOR_DIFF}
+\`\`\`
+Your job at this tier:
+  1. Give a COMPLETE root-cause analysis (component + exact file:line + why).
+  2. In COMPONENT, CLASSIFY the true owner of the root cause — is it \`auto_round\` (the
+     quantization tool itself) or something else (\`model_code\`/\`transformers\`/\`our_code\`/…)?
+  3. REFINE and CONSOLIDATE the prior patch — keep the parts that help, fix what is wrong
+     or incomplete; do NOT blindly revert working changes and do NOT start from scratch.
+  4. If the true root cause is in \`auto_round\`, make the fix INSIDE the auto_round source
+     (it will be captured as the primary patch). Otherwise fix the correct owner.
+"
+    fi
+
+    # Device-specific rules — keep the structured protocol identical across accelerators
+    # (so ERROR_CLASS/COMPONENT/… parsing works everywhere) and only swap the device text.
+    # Default is CUDA (GPU path unchanged); the XPU pipeline exports AGENT_DEVICE_KIND=xpu.
+    local device_kind="${AGENT_DEVICE_KIND:-cuda}" device_rule device_constraints
+    if [ "${device_kind}" = "xpu" ]; then
+        read -r -d '' device_rule <<'EOF' || true
+- XPU IS REQUIRED. This box has Intel XPU (Arc Pro B60, oneAPI/Level-Zero), NOT NVIDIA CUDA. The
+  re-run MUST run on XPU: use `device="xpu"` / `device_map="xpu"`; select devices with
+  `ZE_AFFINITY_MASK` / `ONEAPI_DEVICE_SELECTOR=level_zero:...` (NOT `CUDA_VISIBLE_DEVICES`). In model
+  custom code, change `.cuda()` / `device='cuda'` to `.to("xpu")`. vLLM on XPU: keep
+  `enforce_eager=True` (CUDA graphs unsupported). Verify after any install:
+  `python3 -c "import torch; assert torch.xpu.is_available()"`.
+EOF
+        read -r -d '' device_constraints <<'EOF' || true
+- Do NOT reinstall or downgrade torch — the image ships `torch==2.11.0+xpu`. A plain
+  `pip install torch` pulls the CUDA build and BREAKS XPU. Use `--no-deps` or a torch constraint.
+- **XPU MUST STAY WORKING.** The re-run quantizes on XPU. Never fall back to CPU or CUDA:
+  no `device='cpu'` / `device_map='cpu'`, no `.cuda()`; select the XPU via `ZE_AFFINITY_MASK`.
+  - Beware: `pip install -U auto-round`/`transformers` can pull a CPU/CUDA torch — re-check
+    `python3 -c "import torch; assert torch.xpu.is_available()"` after installing.
+EOF
+    else
+        read -r -d '' device_rule <<'EOF' || true
+- GPU IS REQUIRED. This environment HAS CUDA and the re-run MUST run on GPU. Never force CPU
+  (no `device='cpu'`, no `device_map='cpu'`, do not edit quantize.py to use CPU), never clear
+  `CUDA_VISIBLE_DEVICES`, and never install a CPU-only torch. After any `pip install`, confirm
+  CUDA still works: `python3 -c "import torch; assert torch.cuda.is_available()"`.
+EOF
+        read -r -d '' device_constraints <<'EOF' || true
+- Do NOT reinstall or downgrade torch (it will break CUDA).
+- **CUDA MUST STAY WORKING.** The re-run quantizes on GPU. If your fix leaves the box on CPU
+  (torch.cuda.is_available() == False), the pipeline will REJECT the CPU run as a failure.
+  - Do NOT install a CPU-only torch wheel; if you must (re)install torch, use the matching CUDA wheel.
+  - Do NOT set `CUDA_VISIBLE_DEVICES=""`; do NOT pass `device='cpu'` / `device_map='cpu'`.
+  - Beware: `pip install -U auto-round`/`transformers` can pull a CPU torch — re-check CUDA after installing.
+EOF
+    fi
+
+    cat <<PROMPT
+You are fixing a failed "${phase}" phase in the quantization pipeline.
+
+## Error Output (last 100 lines):
+${error}
+
+${prior_section}
+${prior_diff_section}
+${lessons_section}
+
+## MANDATORY PROTOCOL — fill this out BEFORE editing or installing anything
+
+Debug like a senior engineer (this methodology is self-contained — follow it regardless of backend):
+  1. ATTRIBUTE the bug first: whose layer owns it — our code / a dep (transformers, auto_round,
+     torch) / the model's own code / the data / the environment? The owner dictates where the fix goes.
+  2. Read the traceback BOTTOM-UP: the last exception is where it died; trace UP to the EXACT
+     file:line that is the real cause (skip warnings that have a fallback — they are not the crash).
+  3. VERIFY against the real artifact before touching anything: inspect the actual config / weight
+     names / dtype / installed version with a READ-ONLY command. Never fix from memory or a guess.
+  4. Reason about whether the needed data physically exists: if no option can succeed (the required
+     data isn't there), it must be regenerated upstream — a config tweak can't help.
+  5. Fix the NARROWEST layer; prefer the lowest FIX_TIER; then smoke-test before the full re-run.
+
+You MUST print the block below FIRST. Do NOT modify code or install packages until you have printed
+an EVIDENCE_RESULT from a READ-ONLY command that actually supports your hypothesis. No guessing.
+
+COMPONENT: <our_code|transformers|auto_round|torch|model_code|data|environment>
+ERROR_CLASS: <ONE stable snake_case token naming THIS error's category. Reuse the taxonomy
+             category shown in Quick Classification if it is correct; otherwise give a better
+             existing token or a NEW snake_case name (e.g. shape_mismatch, meta_device_error,
+             unrecognized_config_class). Use the SAME token every time the same underlying
+             error recurs — this drives loop drift detection, so be consistent.>
+ROOT_CAUSE_HYPOTHESIS: <one falsifiable sentence — the specific cause, NOT "maybe a version issue">
+EVIDENCE_CMD: <a single read-only command that verifies the hypothesis>
+EVIDENCE_RESULT: <paste the command's output>
+VERDICT: <FIXABLE | UNFIXABLE | ESCALATE>
+UNFIXABLE_REASON: <required only if UNFIXABLE: e.g. multimodal-unsupported / corrupt weights / needs torch downgrade>
+FIX_TIER: <config | upgrade | workaround | patch>   # always try the LOWEST tier that works
+FIX_PLAN: <3 lines max — what you will change and why it fixes the ROOT CAUSE (not the symptom)>
+SMOKE_TEST: <ONE fast command (NOT the full phase) that proves the fix works, e.g. a tokenizer/model load>
+
+## Rules for this protocol:
+- If VERDICT is UNFIXABLE: print the block and STOP. Do NOT attempt a fix. The pipeline will halt this phase (no wasted retries).
+- If you are confident the fix needs a MORE CAPABLE model than the one you are (deep multi-file
+  reasoning, subtle mixed-precision layout, hard custom-model patch), set VERDICT: ESCALATE and STOP.
+  A stronger model will take over with your notes. Only escalate with a clear reason — don't punt easy fixes.
+- Prefer the LOWEST FIX_TIER. Patching source code is a last resort.
+- Escalate tiers only with evidence that the lower tier cannot work.
+- After applying the fix, RUN your SMOKE_TEST yourself and show its output before finishing.
+${device_rule}
+- This is attempt ${attempt}. Any earlier attempts are in your session history — do NOT repeat a fix that already failed; try a different hypothesis.
+
+## Key Technique: Patching Model Custom Code
+
+If the traceback shows files in \`~/.cache/huggingface/modules/transformers_modules/\`, that is the
+MODEL'S CUSTOM CODE that was downloaded from HuggingFace. **YOU CAN AND SHOULD EDIT THESE FILES.**
+
+Common fixes for model custom code:
+- dtype mismatch (\`.float()\` mixed with bfloat16): Replace \`.float()\` with \`.to(other_tensor.dtype)\`
+- Missing device: Add \`device=hidden_states.device\` to tensor creation
+- Invalid regex: Fix the regex pattern in the model file
+- Missing imports: Add the import or install the package
+
+Example: If you see:
+  File "/root/.cache/huggingface/modules/transformers_modules/Org/Model/hash/model.py", line 147
+    h = h + torch.matmul(compressed[:, k:k+valid_len, :].float(), proj.t())
+  RuntimeError: expected m1 and m2 to have the same dtype
+
+Fix: Edit that file, change \`.float()\` to \`.to(proj.dtype)\`
+
+## Constraints:
+${device_constraints}
+- Do NOT modify the evaluation tasks or expected output format
+- Keep fixes minimal and targeted — change only what's needed
+- If you need to install a package, use: pip install <package>
+- Multimodal/VL models are NOT auto-rejected: AutoRound can quantize the LM backbone of VL/MLLM
+  models (Qwen-VL, LLaVA, InternVL, Qwen3-VL). For image-processor / preprocessor_config / new-arch
+  errors, try \`pip install -U auto-round transformers\` first. Only declare VERDICT: UNFIXABLE for a
+  model with NO text-generation backbone (pure vision/audio encoder).
+- Working directory: ${RUN_OUTPUT_DIR}
+- Model: ${MODEL_ID}
+PROMPT
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# extract_agent_field — pull a labeled single-line field from agent output
+#   Tolerates markdown bold (**FIELD:**) and leading/trailing whitespace.
+# ═══════════════════════════════════════════════════════════════════
+extract_agent_field() {
+    local log="$1"
+    local field="$2"
+    [ -f "${log}" ] || return 0
+    grep -aiE "${field}:" "${log}" 2>/dev/null \
+        | head -1 \
+        | sed -E "s/.*${field}:[[:space:]]*//I" \
+        | sed -E 's/\*+//g; s/^[[:space:]]*//; s/[[:space:]]*$//; s/`//g'
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# agent_verdict — the agent's FINAL, self-declared verdict: FIXABLE|UNFIXABLE|ESCALATE
+#   (prints lowercase, or "" if none). Robust against false positives:
+#     * only a line whose VERDICT value IS one of the tokens counts — prose like
+#       "Only declare VERDICT: UNFIXABLE for a model with no backbone" is IGNORED
+#       (that line has trailing words after the token), as is the protocol menu
+#       "VERDICT: <FIXABLE | UNFIXABLE | ESCALATE>" (value is a <...> placeholder);
+#     * the LAST matching line wins (the agent's final answer, not an early mention
+#       or the prompt template that may have been folded into the log).
+# ═══════════════════════════════════════════════════════════════════
+agent_verdict() {
+    local log="$1"
+    [ -f "${log}" ] || return 0
+    AGENT_LOG_PATH="${log}" python3 <<'PYEOF' 2>/dev/null
+import os, re
+try:
+    txt = open(os.environ["AGENT_LOG_PATH"], encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit
+verdict = ""
+# A real verdict line: optional markdown/bullets, VERDICT:, then EXACTLY one token,
+# then end-of-line (allow trailing punctuation/period). No extra prose words.
+pat = re.compile(r'^[\s>*\-]*VERDICT\s*:?\s*\**\s*(FIXABLE|UNFIXABLE|ESCALATE)\s*\.?\**\s*$',
+                 re.IGNORECASE)
+for line in txt.splitlines():
+    m = pat.match(line)
+    if m:
+        verdict = m.group(1).lower()   # keep the LAST one → the agent's final call
+print(verdict)
+PYEOF
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# extract_agent_analysis — capture the agent's WHOLE structured diagnosis block
+#   (COMPONENT / ERROR_CLASS / ROOT_CAUSE / EVIDENCE / VERDICT / FIX_TIER / FIX_PLAN)
+#   as a compact JSON object, so the lesson stores the agent's ANALYSIS — not just a
+#   grep'd fix line. Multiline field values (e.g. FIX_PLAN) are captured up to the next
+#   known label. Prints "{}" if the log is missing/empty.
+# ═══════════════════════════════════════════════════════════════════
+extract_agent_analysis() {
+    local agent_log="$1"
+    [ -f "${agent_log}" ] || { echo '{}'; return 0; }
+    AGENT_LOG_PATH="${agent_log}" python3 <<'PYEOF'
+import os, re, json
+
+try:
+    log = open(os.environ["AGENT_LOG_PATH"], encoding="utf-8", errors="replace").read()
+except OSError:
+    print("{}"); raise SystemExit
+
+LABELS = ["COMPONENT", "ERROR_CLASS", "ROOT_CAUSE_HYPOTHESIS", "EVIDENCE_CMD",
+          "EVIDENCE_RESULT", "VERDICT", "UNFIXABLE_REASON", "FIX_TIER", "FIX_PLAN",
+          "SMOKE_TEST"]
+
+
+def block(name, maxlen=400):
+    others = "|".join(l for l in LABELS if l != name)
+    m = re.search(rf'^\s*{name}\s*:\s*(.*?)(?=^\s*(?:{others})\s*:|\Z)',
+                  log, re.MULTILINE | re.DOTALL)
+    if not m:
+        return ""
+    val = re.sub(r'`', '', m.group(1))
+    val = re.sub(r'\*+', '', val)
+    val = re.sub(r'\s+', ' ', val).strip()
+    # Drop unfilled placeholders like "<one falsifiable sentence ...>"
+    if val.startswith('<') and val.endswith('>'):
+        return ""
+    return val[:maxlen]
+
+
+err_class = block("ERROR_CLASS", 60)
+if err_class:
+    err_class = re.sub(r'[^a-z0-9_]', '', err_class.split()[0].lower()) if err_class.split() else ""
+
+out = {
+    "component": block("COMPONENT", 60),
+    "error_class": err_class,
+    "root_cause": block("ROOT_CAUSE_HYPOTHESIS", 400),
+    "evidence": block("EVIDENCE_RESULT", 300),
+    "verdict": block("VERDICT", 20),
+    "fix_tier": block("FIX_TIER", 40),
+    "fix_plan": block("FIX_PLAN", 400),
+}
+print(json.dumps({k: v for k, v in out.items() if v}, ensure_ascii=False))
+PYEOF
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# run_smoke_test — run the agent's suggested SMOKE_TEST for cheap verification
+#   Returns 0 if the smoke test passed OR no runnable test could be extracted
+#   (caller then falls back to the normal full phase re-run).
+#   Returns non-zero ONLY when an extracted command actually ran and failed.
+# ═══════════════════════════════════════════════════════════════════
+run_smoke_test() {
+    local agent_log="$1"
+    local cmd
+    cmd=$(extract_agent_field "${agent_log}" "SMOKE_TEST")
+
+    # Empty, placeholder (<...>), or missing → fall back to full re-run
+    if [ -z "${cmd}" ] || printf '%s' "${cmd}" | grep -q '<'; then
+        return 0
+    fi
+    # Only run things that look like an actual command; otherwise fall back
+    case "${cmd}" in
+        python3*|python*|pip*|uv*|bash*|./*) : ;;
+        *) return 0 ;;
+    esac
+
+    log_info "Running agent smoke test: ${cmd}"
+    local _smoke_out="${fix_log_dir:-/tmp}/smoke_${attempt:-0}.log"
+    if timeout "${SMOKE_TEST_TIMEOUT:-180}" bash -c "${cmd}" >"${_smoke_out}" 2>&1; then
+        cat "${_smoke_out}" >>"${agent_log}" 2>/dev/null || true
+        log_ok "Smoke test passed — proceeding to full re-run"
+        return 0
+    fi
+    cat "${_smoke_out}" >>"${agent_log}" 2>/dev/null || true
+
+    # A MALFORMED smoke command (the agent appended prose after the command, e.g.
+    # `python3 -c "..."; plus a minimal calibration call`, or an unknown binary /
+    # shell syntax error) is INCONCLUSIVE — it does NOT prove the fix failed. Don't
+    # skip the (authoritative) full re-run on such noise; only a genuine failure
+    # (assertion/import/runtime error from a well-formed command) should skip it.
+    if grep -qiE 'command not found|: not found|syntax error|unexpected token|No such file or directory' \
+         "${_smoke_out}" 2>/dev/null; then
+        log_warn "Smoke test command looks malformed (agent added prose/typo) — treating as inconclusive, proceeding to full re-run."
+        return 0
+    fi
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# save_lesson — persist a lesson to the JSONL file
+# ═══════════════════════════════════════════════════════════════════
+save_lesson() {
+    local phase="$1"
+    local error_context="$2"
+    local status="$3"
+    local solution_note="$4"
+    local agent_analysis="${5:-}"   # optional: agent's structured diagnosis as JSON
+                                    # (or a bare snake_case class token, for back-compat)
+
+    local lessons_file="${LESSONS_DIR}/${phase}.jsonl"
+    mkdir -p "${LESSONS_DIR}"
+
+    # Pass error_context via env var (not stdin, which conflicts with heredoc)
+    LESSON_ERROR_CONTEXT="${error_context}" LESSON_TAXONOMY_DIR="${ERROR_ANALYSIS_DIR}" LESSON_AGENT_ANALYSIS="${agent_analysis}" python3 - "${phase}" "${status}" "${solution_note}" "${MODEL_ID:-unknown}" "${SCHEME:-W4A16}" "${METHOD:-RTN}" "${lessons_file}" <<'PYEOF'
+import json
+import sys
+import os
+import datetime
+import re
+
+phase = sys.argv[1]
+status = sys.argv[2]
+solution_note = sys.argv[3]
+model_id = sys.argv[4]
+scheme = sys.argv[5]
+method = sys.argv[6]
+lessons_file = sys.argv[7]
+
+error_context = os.environ.get("LESSON_ERROR_CONTEXT", "")
+
+# Reuse the shared taxonomy: denoise + deterministic classification. This is the SAME
+# classifier the drift detector and post-mortem diagnosis use, so a lesson's category is
+# consistent across the whole pipeline. Degrade gracefully if the import fails.
+sys.path.insert(0, os.environ.get("LESSON_TAXONOMY_DIR", ""))
+try:
+    from taxonomy import _strip_noise, classify_error
+except Exception:
+    def _strip_noise(t):
+        return t
+
+    def classify_error(t):
+        return "unknown", {}
+
+# Strip a leading timestamp / log-level prefix so signatures are stable across runs
+# (e.g. "15:51:56 [ERROR] Quantization failed: X" and the same error an hour later
+# must produce the SAME signature so dedup works).
+_PREFIX_RE = re.compile(
+    r'^\s*'
+    r'(?:\d{4}-\d{2}-\d{2}[T ])?'              # optional ISO date
+    r'(?:\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)?'      # optional HH:MM:SS(.ms)
+    r'(?:\s*[Zz]|\s*[+-]\d{2}:?\d{2})?'        # optional timezone
+    r'\s*(?:\[[A-Za-z]+\]|[A-Z]{3,}:)?\s*'     # optional [ERROR] / ERROR:
+)
+
+
+def _clean(line):
+    return _PREFIX_RE.sub('', line).strip()
+
+
+# Python's real fault is the LAST exception line of a traceback, not the first line that
+# merely mentions "error". Prefer the deepest concrete exception; then a wrapper line that
+# actually carries a message; then the last meaningful denoised line.
+_EXC_RE = re.compile(r'\b([A-Za-z_][\w.]*(?:Error|Exception|Warning)|OSError)\b\s*:\s*\S')
+_WRAP_RE = re.compile(r'\b(?:failed|error)\b\s*[:\-]\s*(\S.+)', re.I)
+
+
+def extract_signature(text):
+    denoised = _strip_noise(text) or text
+    lines = [l for l in denoised.splitlines() if l.strip()]
+    exc = [_clean(l) for l in lines if _EXC_RE.search(_clean(l))]
+    if exc:
+        return exc[-1][:150]
+    for l in reversed(lines):
+        c = _clean(l)
+        m = _WRAP_RE.search(c)
+        if m and m.group(1).strip():
+            return c[:150]
+    return _clean(lines[-1])[:150] if lines else "unknown error"
+
+
+error_signature = extract_signature(error_context)
+
+# Persist the deterministic category at write time -> enables coverage measurement and
+# L3 self-learning (promoting recurring "unknown" categories into the taxonomy later).
+try:
+    error_category = classify_error(error_context)[0]
+except Exception:
+    error_category = "unknown"
+
+# The agent's semantic ERROR_CLASS (may be a NEW category the taxonomy doesn't know yet).
+# This is the raw material for L3: when taxonomy says "unknown" but the agent consistently
+# assigns the same label to a recurring error, promote_lessons.py can learn a signature.
+# Arg is a JSON blob of the agent's whole diagnosis (or a bare class token for back-compat).
+_raw_analysis = os.environ.get("LESSON_AGENT_ANALYSIS", "").strip()
+agent = {}
+if _raw_analysis:
+    try:
+        parsed = json.loads(_raw_analysis)
+        if isinstance(parsed, dict):
+            agent = parsed
+    except ValueError:
+        # Back-compat: a bare "error_class" token rather than JSON
+        agent = {"error_class": _raw_analysis}
+
+agent_category = re.sub(r'[^a-z0-9_]', '', str(agent.get("error_class", "")).strip().lower())
+agent_root_cause = str(agent.get("root_cause", ""))[:400]
+agent_component = str(agent.get("component", ""))[:60]
+agent_evidence = str(agent.get("evidence", ""))[:300]
+agent_fix_tier = str(agent.get("fix_tier", ""))[:40]
+# Prefer the agent's FIX_PLAN as the solution when the caller's note is thin/placeholder.
+agent_fix_plan = str(agent.get("fix_plan", ""))[:400]
+if agent_fix_plan and (not solution_note or len(solution_note) < 15):
+    solution_note = agent_fix_plan
+
+# Extract keywords from the cleaned signature
+words = re.findall(r'[a-zA-Z]{4,}', error_signature.lower())
+keywords = list(dict.fromkeys(words))[:5]  # unique, ordered
+
+# Full traceback (last 50 lines, denoised so 404/progress chatter doesn't crowd it out)
+traceback_lines = (_strip_noise(error_context) or error_context).strip().splitlines()[-50:]
+error_traceback = "\n".join(traceback_lines)
+
+lesson = {
+    "id": f"lesson-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "phase": phase,
+    "error_signature": error_signature,
+    "error_category": error_category,
+    "agent_category": agent_category,
+    "agent_root_cause": agent_root_cause,
+    "agent_component": agent_component,
+    "agent_evidence": agent_evidence,
+    "fix_tier": agent_fix_tier,
+    "error_traceback": error_traceback,
+    "error_keywords": keywords,
+    "model": model_id,
+    "scheme": scheme,
+    "method": method,
+    "solution": solution_note,
+    "status": status,
+    "verified_count": 1,
+    "source_tasks": [f"{model_id}_{scheme}_{method}"],
+}
+
+with open(lessons_file, "a") as f:
+    f.write(json.dumps(lesson, ensure_ascii=False) + "\n")
+
+print(f"[lesson] Saved: [{status}] {error_signature[:80]}")
+print(f"[lesson]   Solution: {solution_note}")
+PYEOF
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# load_all_lessons — load all lessons as text for agent to decide relevance
+# ═══════════════════════════════════════════════════════════════════
+load_all_lessons() {
+    [ ! -d "${LESSONS_DIR}" ] && return 0
+
+    python3 - "${LESSONS_DIR}" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+lessons_dir = Path(sys.argv[1])
+lessons = []
+
+for fpath in sorted(lessons_dir.glob("*.jsonl")):
+    try:
+        with open(fpath) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                lesson = json.loads(line)
+                # Only load actionable lessons (fixed/verified/seed) plus known-unfixable
+                # verdicts so the agent can stop early on a previously-hopeless error.
+                if lesson.get("status") in ("fixed", "seed", "verified", "unfixable"):
+                    lessons.append(lesson)
+    except (FileNotFoundError, json.JSONDecodeError):
+        continue
+
+# Deduplicate by error_signature
+seen = set()
+unique = []
+for les in lessons:
+    sig = les.get("error_signature", "")
+    if sig not in seen:
+        seen.add(sig)
+        unique.append(les)
+
+# Sort by verified_count (most reliable first), cap at 10 to avoid huge prompts
+unique.sort(key=lambda x: x.get("verified_count", 0), reverse=True)
+for i, les in enumerate(unique[:10], 1):
+    verified = les.get("verified_count", 0)
+    phase = les.get("phase", "?")
+    sig = les.get("error_signature", "")[:120]
+    solution = les.get("solution", "")
+    notes = les.get("notes", "")
+    print(f"Lesson {i} [phase={phase}, verified={verified}x]:")
+    print(f"  Error: {sig}")
+    print(f"  Solution: {solution}")
+    if notes:
+        print(f"  Notes: {notes}")
+    print()
+PYEOF
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# maybe_compact_lessons — compact if > 50 entries
+# ═══════════════════════════════════════════════════════════════════
+maybe_compact_lessons() {
+    local compact_script="${LESSONS_DIR}/compact_lessons.py"
+    [ ! -f "${compact_script}" ] && return 0
+
+    for f in "${LESSONS_DIR}"/*.jsonl; do
+        [ ! -f "$f" ] && continue
+        local count
+        count=$(wc -l < "$f")
+        if [ "$count" -gt 50 ]; then
+            log_info "Compacting lessons (${count} entries in $(basename "$f"))..."
+            python3 "${compact_script}" "${LESSONS_DIR}"
+            break
+        fi
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# push_lessons_to_git — commit and push lessons
+# ═══════════════════════════════════════════════════════════════════
+push_lessons_to_git() {
+    maybe_compact_lessons
+
+    local lessons_dir="${LESSONS_DIR:-}"
+    [ -z "${lessons_dir}" ] && return 0
+    [ ! -d "${lessons_dir}" ] && return 0
+
+    # Check if any lessons exist to push
+    local has_lessons=false
+    for f in "${lessons_dir}"/*.jsonl; do
+        [ -f "$f" ] && has_lessons=true && break
+    done
+    [ "${has_lessons}" = false ] && return 0
+
+    # Need GIT_TOKEN and GIT_REPO to push
+    if [[ -z "${GIT_TOKEN:-}" || -z "${GIT_REPO:-}" ]]; then
+        log_warn "push_lessons: GIT_TOKEN or GIT_REPO not set, skipping"
+        return 0
+    fi
+
+    local branch="${GIT_BRANCH:-main}"
+    local auth_url="${GIT_REPO/https:\/\//https://x-access-token:${GIT_TOKEN}@}"
+    local tmp_clone="${RUN_OUTPUT_DIR}/.lessons_push_tmp"
+
+    # Clone fresh (shallow, only the branch we need)
+    rm -rf "${tmp_clone}"
+    log_info "push_lessons: cloning repo for lessons push..."
+    if ! git clone --depth 1 --branch "${branch}" "${auth_url}" "${tmp_clone}" 2>/dev/null; then
+        log_warn "push_lessons: git clone failed"
+        return 0
+    fi
+
+    # Copy lessons into the clone
+    mkdir -p "${tmp_clone}/auto_quant/lessons"
+    cp -f "${lessons_dir}"/*.jsonl "${tmp_clone}/auto_quant/lessons/" 2>/dev/null || true
+
+    # Commit and push
+    cd "${tmp_clone}"
+    git config user.name "${GIT_USER_NAME:-auto-pipeline}"
+    git config user.email "${GIT_USER_EMAIL:-auto@pipeline.local}"
+    git add --force auto_quant/lessons/ 2>/dev/null || true
+
+    if ! git diff --cached --quiet auto_quant/lessons/ 2>/dev/null; then
+        git commit -m "lessons: update from ${MODEL_ID:-unknown} ${SCHEME:-} ${METHOD:-}" || true
+        git push origin "${branch}" 2>/dev/null && log_ok "push_lessons: pushed successfully" || log_warn "push_lessons: git push failed"
+    else
+        log_info "push_lessons: no changes to push"
+    fi
+
+    cd - > /dev/null
+    rm -rf "${tmp_clone}"
+}

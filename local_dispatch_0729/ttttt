@@ -1,0 +1,13 @@
+(base) root@mlp-milan-01:~/new_commit/local_dispatch# bash run.sh
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Traceback (most recent call last):
+  File "/root/new_commit/local_dispatch/reserve_and_login.py", line 526, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/root/new_commit/local_dispatch/reserve_and_login.py", line 388, in main
+    res = dispatch(
+          ^^^^^^^^^
+  File "/root/new_commit/local_dispatch/reserve_and_login.py", line 293, in dispatch
+    log.info("host-override: %s → %s", cand.host, host_override)
+    ^^^
+NameError: name 'log' is not defined
